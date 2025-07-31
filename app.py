@@ -9,7 +9,8 @@ import time
 import re
 from dataclasses import dataclass
 import logging
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 import os
 
 # Configure page
@@ -117,12 +118,17 @@ class ArcGISPortalConnector:
         return all_items[:max_items]
 
 @st.cache_resource
-def load_embedding_model():
-    """Load the sentence transformer model (cached)"""
+def load_tfidf_vectorizer():
+    """Load the TF-IDF vectorizer (cached)"""
     try:
-        return SentenceTransformer('all-MiniLM-L6-v2')
+        return TfidfVectorizer(
+            max_features=5000,
+            stop_words='english',
+            ngram_range=(1, 2),
+            lowercase=True
+        )
     except Exception as e:
-        st.error(f"Failed to load embedding model: {e}")
+        st.error(f"Failed to load vectorizer: {e}")
         return None
 
 @st.cache_data(ttl=3600)  # Cache for 1 hour
@@ -163,13 +169,13 @@ def load_portal_data():
     return data_items
 
 @st.cache_data(ttl=3600)
-def create_embeddings(data_items):
-    """Create embeddings for all data items (cached)"""
-    model = load_embedding_model()
-    if not model:
-        return None, None
+def create_search_index(data_items):
+    """Create TF-IDF search index for all data items (cached)"""
+    vectorizer = load_tfidf_vectorizer()
+    if not vectorizer:
+        return None, None, None
     
-    # Prepare text for embedding
+    # Prepare text for indexing
     texts = []
     for item in data_items:
         # Create rich text representation
@@ -177,43 +183,50 @@ def create_embeddings(data_items):
             item.title,
             item.description or item.snippet or "",
             " ".join(item.tags),
-            item.type
+            item.type,
+            item.owner
         ]
         text = ". ".join([part for part in text_parts if part.strip()])
         texts.append(text)
     
-    # Create embeddings
-    with st.spinner("Creating search embeddings..."):
-        embeddings = model.encode(texts, show_progress_bar=True)
-    
-    return embeddings, texts
+    # Create TF-IDF matrix
+    with st.spinner("Creating search index..."):
+        try:
+            tfidf_matrix = vectorizer.fit_transform(texts)
+            return vectorizer, tfidf_matrix, texts
+        except Exception as e:
+            st.error(f"Failed to create search index: {e}")
+            return None, None, None
 
-def semantic_search(query: str, data_items: List[GISDataItem], embeddings, texts, top_k: int = 10):
-    """Perform semantic search using embeddings"""
-    model = load_embedding_model()
-    if not model or embeddings is None:
+def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf_matrix, texts, top_k: int = 10):
+    """Perform semantic search using TF-IDF"""
+    if not vectorizer or tfidf_matrix is None:
         return []
     
-    # Create query embedding
-    query_embedding = model.encode([query])
-    
-    # Calculate similarities
-    similarities = np.dot(embeddings, query_embedding.T).flatten()
-    
-    # Get top results
-    top_indices = np.argsort(similarities)[::-1][:top_k]
-    
-    results = []
-    for idx in top_indices:
-        if similarities[idx] > 0.1:  # Minimum similarity threshold
-            item = data_items[idx]
-            results.append({
-                'item': item,
-                'similarity': float(similarities[idx]),
-                'text': texts[idx]
-            })
-    
-    return results
+    try:
+        # Create query vector
+        query_vector = vectorizer.transform([query])
+        
+        # Calculate similarities
+        similarities = cosine_similarity(query_vector, tfidf_matrix).flatten()
+        
+        # Get top results
+        top_indices = np.argsort(similarities)[::-1][:top_k]
+        
+        results = []
+        for idx in top_indices:
+            if similarities[idx] > 0.05:  # Minimum similarity threshold
+                item = data_items[idx]
+                results.append({
+                    'item': item,
+                    'similarity': float(similarities[idx]),
+                    'text': texts[idx] if texts else ""
+                })
+        
+        return results
+    except Exception as e:
+        st.error(f"Search error: {e}")
+        return []
 
 def keyword_search(query: str, data_items: List[GISDataItem], top_k: int = 10):
     """Fallback keyword search"""
@@ -325,11 +338,11 @@ def main():
         data_items = load_portal_data()
         st.sidebar.success(f"✅ {len(data_items)} datasets loaded")
         
-        # Create embeddings for semantic search
-        embeddings, texts = None, None
+        # Create search index for semantic search
+        vectorizer, tfidf_matrix, texts = None, None, None
         if search_method == "Semantic Search (AI)":
-            embeddings, texts = create_embeddings(data_items)
-            if embeddings is not None:
+            vectorizer, tfidf_matrix, texts = create_search_index(data_items)
+            if vectorizer is not None:
                 st.sidebar.success("✅ AI search ready")
             else:
                 st.sidebar.error("❌ AI search unavailable")
@@ -354,8 +367,8 @@ def main():
         if query.strip():
             with st.spinner("Searching..."):
                 # Perform search
-                if search_method == "Semantic Search (AI)" and embeddings is not None:
-                    results = semantic_search(query, data_items, embeddings, texts, num_results)
+                if search_method == "Semantic Search (AI)" and vectorizer is not None:
+                    results = semantic_search(query, data_items, vectorizer, tfidf_matrix, texts, num_results)
                 else:
                     results = keyword_search(query, data_items, num_results)
                 
