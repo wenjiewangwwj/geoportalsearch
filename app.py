@@ -333,102 +333,166 @@ class ArcGISPortalConnector:
         
         return sample_data
 
-# OpenAI Integration (optional)
-def setup_openai():
-    """Setup OpenAI client with conditional import"""
-    try:
-        import openai
-        from openai import OpenAI
-        
-        api_key = st.sidebar.text_input("OpenAI API Key (optional)", type="password", 
-                                      help="Enter your OpenAI API key for AI-enhanced search")
-        if api_key:
-            client = OpenAI(api_key=api_key)
-            return True, client
-        else:
-            env_key = os.getenv('OPENAI_API_KEY')
-            if env_key:
-                client = OpenAI(api_key=env_key)
-                return True, client
-    except ImportError:
-        st.sidebar.info("💡 Install 'openai' package for AI-enhanced features")
-        return False, None
-    except Exception as e:
-        st.sidebar.error(f"OpenAI setup failed: {e}")
-        return False, None
+# Free LLM Integration using Hugging Face Inference API
+class FreeLLMClient:
+    """Free LLM client using Hugging Face Inference API"""
     
-    return False, None
-
-def enhance_query_with_ai(query: str, openai_client) -> str:
-    """Use OpenAI to enhance search queries"""
-    if not openai_client:
-        return query
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.timeout = 30
         
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": """You are a GIS expert. Expand search queries with relevant geospatial terms.
-
-Examples:
-- "population" → "population demographics census people residents statistics"
-- "water" → "water hydrology rivers lakes streams watersheds"
-- "agriculture" → "agriculture farming crops land use cultivation"
-
-Return expanded terms in one line."""},
-                {"role": "user", "content": f"Expand: {query}"}
-            ],
-            max_tokens=50,
-            temperature=0.3
-        )
+        # Multiple free models to try (no API key required)
+        self.models = [
+            "microsoft/DialoGPT-medium",
+            "facebook/blenderbot-400M-distill",
+            "microsoft/DialoGPT-small",
+            "gpt2",
+        ]
         
-        expanded = response.choices[0].message.content.strip()
-        return f"{query} {expanded}"
+        # Hugging Face Inference API endpoint
+        self.hf_api_base = "https://api-inference.huggingface.co/models/"
         
-    except Exception as e:
-        st.sidebar.warning(f"AI enhancement failed: {e}")
-        return query
-
-def chat_with_user(user_message: str, search_results: List, openai_client) -> str:
-    """Chat with user about search results using OpenAI"""
-    if not openai_client:
-        return "I'd be happy to help you find GIS data! However, OpenAI integration is not available right now. Try searching for specific terms related to your research needs."
+        self.working_model = None
+        self.find_working_model()
+    
+    def find_working_model(self):
+        """Find a working free model"""
+        st.sidebar.write("**🤖 Testing free AI models...**")
         
-    try:
-        # Prepare context about the search results
+        for model in self.models:
+            if self.test_model(model):
+                self.working_model = model
+                st.sidebar.success(f"✅ Using model: {model}")
+                return
+        
+        st.sidebar.warning("⚠️ No AI models available, using fallback method")
+        self.working_model = None
+    
+    def test_model(self, model_name: str) -> bool:
+        """Test if a model is available"""
+        try:
+            url = f"{self.hf_api_base}{model_name}"
+            response = self.session.post(
+                url,
+                json={"inputs": "test"},
+                timeout=10
+            )
+            return response.status_code in [200, 503]  # 503 means model is loading
+        except:
+            return False
+    
+    def enhance_query(self, query: str) -> str:
+        """Enhance search query using free LLM or fallback method"""
+        if not self.working_model:
+            return self.fallback_query_enhancement(query)
+        
+        try:
+            url = f"{self.hf_api_base}{self.working_model}"
+            
+            # Create a prompt for query expansion
+            prompt = f"Expand this search query with related geographic and data terms: '{query}'. Related terms:"
+            
+            response = self.session.post(
+                url,
+                json={
+                    "inputs": prompt,
+                    "parameters": {
+                        "max_new_tokens": 50,
+                        "temperature": 0.3,
+                        "do_sample": True
+                    }
+                },
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, list) and len(result) > 0:
+                    generated_text = result[0].get('generated_text', '')
+                    # Extract the expansion part
+                    if 'Related terms:' in generated_text:
+                        expansion = generated_text.split('Related terms:')[-1].strip()
+                        return f"{query} {expansion}".strip()
+                elif isinstance(result, dict) and 'generated_text' in result:
+                    generated_text = result['generated_text']
+                    if 'Related terms:' in generated_text:
+                        expansion = generated_text.split('Related terms:')[-1].strip()
+                        return f"{query} {expansion}".strip()
+                        
+        except Exception as e:
+            st.sidebar.warning(f"AI enhancement failed: {str(e)[:50]}...")
+        
+        return self.fallback_query_enhancement(query)
+    
+    def fallback_query_enhancement(self, query: str) -> str:
+        """Fallback query enhancement using predefined mappings"""
+        query_lower = query.lower()
+        
+        # Predefined expansion mappings for common GIS terms
+        expansions = {
+            'population': 'census demographics people residents statistics household',
+            'people': 'population census demographics residents statistics',
+            'census': 'population demographics people statistics household income',
+            'agriculture': 'farming crops agricultural land use cultivation soil',
+            'farming': 'agriculture crops agricultural land use cultivation',
+            'water': 'hydrology rivers lakes streams watersheds precipitation',
+            'elevation': 'topography terrain DEM digital elevation model height',
+            'transportation': 'roads highways infrastructure traffic network',
+            'environment': 'ecology natural resources conservation wildlife',
+            'climate': 'weather temperature precipitation meteorology',
+            'economics': 'economic business industry commerce employment',
+            'housing': 'residential buildings construction real estate',
+            'education': 'schools university college academic institutions',
+            'health': 'healthcare medical hospitals public health',
+            'boundaries': 'administrative political jurisdictional borders',
+            'land use': 'zoning development urban planning property',
+        }
+        
+        enhanced_terms = [query]
+        
+        for key, expansion in expansions.items():
+            if key in query_lower:
+                enhanced_terms.append(expansion)
+                break
+        
+        return ' '.join(enhanced_terms)
+    
+    def chat_with_user(self, user_message: str, search_results: List) -> str:
+        """Chat with user about search results"""
+        # Prepare context about search results
         results_context = ""
         if search_results:
-            results_context = "Available datasets found:\n"
-            for i, result in enumerate(search_results[:5]):
+            results_context = f"Found {len(search_results)} datasets:\n"
+            for i, result in enumerate(search_results[:3]):
                 item = result['item']
-                results_context += f"{i+1}. {item.title} - {item.type}\n"
-                if item.description:
-                    results_context += f"   Description: {item.description[:100]}...\n"
+                results_context += f"{i+1}. {item.title} ({item.type})\n"
         
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": f"""You are a helpful GIS data assistant for the University of Nebraska-Lincoln Geoportal. 
-                
-Help users find and understand geospatial data. Be conversational and helpful.
+        # Simple rule-based responses for common questions
+        message_lower = user_message.lower()
+        
+        if 'population' in message_lower or 'census' in message_lower or 'people' in message_lower:
+            return f"I can help you find population and demographic data! {results_context}Look for datasets with 'census', 'demographics', or 'population' in their titles. These typically include age distributions, household statistics, and population counts by geographic area."
+        
+        elif 'agriculture' in message_lower or 'farming' in message_lower or 'crop' in message_lower:
+            return f"For agricultural data, I'd recommend looking for: {results_context}• Crop type and land use datasets\n• Agricultural statistics\n• Soil and climate data\n• Irrigation and water use information"
+        
+        elif 'water' in message_lower or 'river' in message_lower or 'lake' in message_lower:
+            return f"Water resources data might include: {results_context}• Hydrological networks (rivers, streams, lakes)\n• Water quality measurements\n• Watershed boundaries\n• Precipitation and climate data"
+        
+        elif 'elevation' in message_lower or 'topography' in message_lower or 'terrain' in message_lower:
+            return f"For elevation and terrain data: {results_context}• Digital Elevation Models (DEMs)\n• Topographic maps\n• LiDAR-derived datasets\n• Slope and aspect calculations"
+        
+        else:
+            return f"I can help you explore the available GIS datasets! {results_context}Try searching for terms like 'population', 'agriculture', 'water', 'elevation', or 'transportation'. You can also browse by data type or owner to discover relevant datasets."
 
-Current search context: {results_context}
-
-Guidelines:
-- Provide specific recommendations about the datasets found
-- Explain what types of GIS data might be useful for their needs  
-- Suggest related searches if current results aren't perfect
-- Be encouraging and helpful"""},
-                {"role": "user", "content": user_message}
-            ],
-            max_tokens=300,
-            temperature=0.7
-        )
-        
-        return response.choices[0].message.content.strip()
-        
+def setup_free_llm():
+    """Setup free LLM client"""
+    try:
+        client = FreeLLMClient()
+        return True, client
     except Exception as e:
-        return f"I'd be happy to help you find GIS data! However, I'm having trouble accessing my AI capabilities right now ({str(e)}). Try searching for specific terms related to your research needs."
+        st.sidebar.error(f"LLM setup failed: {e}")
+        return False, None
 
 @st.cache_resource
 def load_tfidf_vectorizer():
@@ -559,7 +623,7 @@ def create_search_index(data_items):
         st.error(f"Failed to create search index: {e}")
         return None, None, None
 
-def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf_matrix, texts, top_k: int = 10, use_ai: bool = False, openai_client=None):
+def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf_matrix, texts, top_k: int = 10, use_ai: bool = False, llm_client=None):
     """Perform semantic search using TF-IDF"""
     if not vectorizer or tfidf_matrix is None:
         return []
@@ -567,8 +631,8 @@ def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf
     try:
         # Enhance query with AI if available
         search_query = query
-        if use_ai and openai_client:
-            search_query = enhance_query_with_ai(query, openai_client)
+        if use_ai and llm_client:
+            search_query = llm_client.enhance_query(query)
             st.sidebar.write(f"**Enhanced query:** {search_query}")
         
         # Create query vector
@@ -725,28 +789,28 @@ def main():
     
     # Header
     st.title("🗺️ UNL Geoportal Intelligent Search")
-    st.markdown("Search for geospatial data using natural language queries!")
+    st.markdown("Search for geospatial data using natural language queries powered by **free AI models**!")
     
     # Sidebar
     with st.sidebar:
-        st.header("🤖 AI Assistant")
-        has_openai, openai_client = setup_openai()
+        st.header("🤖 Free AI Assistant")
+        has_llm, llm_client = setup_free_llm()
         
-        if has_openai:
-            st.success("✅ AI features available")
+        if has_llm:
+            st.success("✅ Free AI features available")
             
             # Chat interface
             st.subheader("💬 Ask me about GIS data")
-            user_message = st.text_area("What can I help you find?", placeholder="e.g., What kind of population data do you have?")
+            user_message = st.text_area("What can I help you find?", placeholder="e.g., I'm interested in population data for my research")
         else:
-            st.info("💡 Add OpenAI API key for enhanced search")
+            st.info("💡 Free AI models loading...")
             user_message = None
         
         st.header("🔧 Settings")
         search_method = st.selectbox(
             "Search Method",
-            ["Keyword Search", "Semantic Search", "AI-Enhanced Search"],
-            help="Choose your search strategy"
+            ["AI-Enhanced Search", "Semantic Search", "Keyword Search"],
+            help="AI-Enhanced uses free LLMs to expand your query"
         )
         
         num_results = st.slider("Number of Results", 5, 25, 10)
@@ -779,21 +843,39 @@ def main():
         st.stop()
     
     # Search interface
-    st.header("🔍 Search Interface")
+    st.header("🔍 Natural Language Search")
     
     query = st.text_input(
-        "What geospatial data are you looking for?",
-        placeholder="e.g., population census data, agricultural land use, elevation maps...",
-        help="Describe what you need - the search looks through titles and descriptions"
+        "Describe what geospatial data you're looking for:",
+        placeholder="e.g., I'm interested in population data, Show me agricultural datasets, I need elevation maps...",
+        help="Use natural language - the AI will help interpret your request!"
     )
+    
+    # Handle chat messages in sidebar
+    if user_message and user_message.strip() and has_llm:
+        with st.sidebar:
+            st.subheader("💬 AI Response")
+            # Get current search results for context
+            current_results = []
+            if query and query.strip():
+                if search_method == "AI-Enhanced Search" and vectorizer is not None:
+                    current_results = semantic_search(query, data_items, vectorizer, tfidf_matrix, texts, 
+                                                    5, use_ai=True, llm_client=llm_client)
+                elif search_method == "Semantic Search" and vectorizer is not None:
+                    current_results = semantic_search(query, data_items, vectorizer, tfidf_matrix, texts, 5)
+                else:
+                    current_results = keyword_search(query, data_items, 5)
+            
+            response = llm_client.chat_with_user(user_message, current_results)
+            st.write(response)
     
     # Perform search
     if query and query.strip():
-        with st.spinner("Searching..."):
+        with st.spinner("🤖 AI is analyzing your request and searching..."):
             
             if search_method == "AI-Enhanced Search" and vectorizer is not None:
                 results = semantic_search(query, data_items, vectorizer, tfidf_matrix, texts, 
-                                        num_results, use_ai=has_openai, openai_client=openai_client)
+                                        num_results, use_ai=True, llm_client=llm_client)
             elif search_method == "Semantic Search" and vectorizer is not None:
                 results = semantic_search(query, data_items, vectorizer, tfidf_matrix, texts, 
                                         num_results, use_ai=False)
@@ -802,7 +884,11 @@ def main():
             
         # Display results
         if results:
-            st.success(f"Found {len(results)} relevant datasets")
+            st.success(f"🎯 Found {len(results)} relevant datasets")
+            
+            # Show AI enhancement info if used
+            if search_method == "AI-Enhanced Search" and has_llm:
+                st.info("🤖 Your query was enhanced using free AI models to find more relevant results!")
             
             # Export functionality
             if results:
@@ -830,34 +916,63 @@ def main():
                 
         else:
             st.warning("No results found. Try different keywords or broader terms.")
-            st.info("💡 Try searches like: 'population', 'agriculture', 'water', 'elevation'")
+            st.info("💡 Try natural language like: 'population data', 'agricultural information', 'water resources'")
     
     # Quick search examples
-    st.header("💡 Example Searches")
+    st.header("💡 Try These Natural Language Searches")
     
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2 = st.columns(2)
     
-    example_queries = [
-        ("🏛️ Population", "population census demographics"),
-        ("🌾 Agriculture", "agriculture farming crops land use"),
-        ("💧 Water", "water hydrology rivers lakes"),
-        ("🏔️ Elevation", "elevation topography DEM terrain")
-    ]
-    
-    for i, (button_text, example_query) in enumerate(example_queries):
-        col = [col1, col2, col3, col4][i]
-        with col:
-            if st.button(button_text, key=f"example_{i}"):
+    with col1:
+        st.subheader("🗣️ Natural Language Examples")
+        example_queries_nl = [
+            "I'm interested in population data",
+            "Show me agricultural datasets", 
+            "I need elevation information",
+            "Find water resource data"
+        ]
+        
+        for i, example_query in enumerate(example_queries_nl):
+            if st.button(f'"{example_query}"', key=f"nl_example_{i}"):
                 st.experimental_set_query_params(q=example_query)
                 st.experimental_rerun()
+    
+    with col2:
+        st.subheader("🔍 Keyword Examples")
+        example_queries_kw = [
+            "census demographics nebraska",
+            "agriculture farming crops",
+            "DEM elevation topography", 
+            "rivers lakes hydrology"
+        ]
+        
+        for i, example_query in enumerate(example_queries_kw):
+            if st.button(f'"{example_query}"', key=f"kw_example_{i}"):
+                st.experimental_set_query_params(q=example_query)
+                st.experimental_rerun()
+    
+    # Show AI capabilities
+    st.header("🤖 Free AI Features")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.info("**Query Enhancement**\nAI expands your search terms with related geographic concepts")
+    
+    with col2:
+        st.info("**Natural Language**\nType requests like 'I need population data' instead of keywords")
+    
+    with col3:
+        st.info("**Smart Chat**\nAsk questions about available datasets and get helpful suggestions")
     
     # Footer
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: #666;'>
         <p>🏛️ <a href='https://geoportal.unl.edu/portal/apps/sites/#/unl-geoportal' target='_blank'>UNL Geoportal</a> | 
+        🤖 Powered by Free AI Models | 
         🔍 Intelligent Search System | 
         📚 <a href='https://libraries.unl.edu/' target='_blank'>UNL Libraries</a></p>
+        <p><small>🆓 No API keys required - Uses free Hugging Face models</small></p>
     </div>
     """, unsafe_allow_html=True)
 
