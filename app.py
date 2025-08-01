@@ -121,11 +121,17 @@ class ArcGISPortalConnector:
 def load_tfidf_vectorizer():
     """Load the TF-IDF vectorizer (cached)"""
     try:
+        # Custom stop words - remove common but not useful GIS terms
+        custom_stop_words = ['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could', 'can', 'may', 'might', 'must', 'shall']
+        
         return TfidfVectorizer(
-            max_features=5000,
-            stop_words='english',
-            ngram_range=(1, 2),
-            lowercase=True
+            max_features=10000,
+            stop_words=custom_stop_words,  # Use custom stop words instead of 'english'
+            ngram_range=(1, 3),  # Include 3-grams to catch phrases like "census blocks"
+            lowercase=True,
+            min_df=1,  # Include words that appear in at least 1 document
+            max_df=0.95,  # Exclude words that appear in more than 95% of documents
+            token_pattern=r'\b[a-zA-Z][a-zA-Z0-9_]*\b'  # Include numbers and underscores
         )
     except Exception as e:
         st.error(f"Failed to load vectorizer: {e}")
@@ -178,24 +184,61 @@ def create_search_index(data_items):
     # Prepare text for indexing
     texts = []
     for item in data_items:
-        # Create rich text representation
-        text_parts = [
-            item.title,
-            item.description or item.snippet or "",
-            " ".join(item.tags),
-            item.type,
-            item.owner
-        ]
-        text = ". ".join([part for part in text_parts if part.strip()])
+        # Create rich text representation with better formatting
+        text_parts = []
+        
+        # Add title (most important)
+        if item.title:
+            text_parts.append(item.title)
+        
+        # Add description/snippet
+        description = item.description or item.snippet or ""
+        if description:
+            text_parts.append(description)
+        
+        # Add tags (very important for search)
+        if item.tags:
+            text_parts.append(" ".join(item.tags))
+        
+        # Add type
+        if item.type:
+            text_parts.append(item.type)
+        
+        # Add owner
+        if item.owner:
+            text_parts.append(item.owner)
+        
+        # Join all parts
+        text = " ".join([part for part in text_parts if part.strip()])
+        
+        # Ensure we have some text
+        if not text.strip():
+            text = f"untitled {item.type or 'dataset'}"
+        
         texts.append(text)
+    
+    # Debug: Show some sample texts
+    st.sidebar.write("Sample indexed text:")
+    for i, text in enumerate(texts[:3]):
+        st.sidebar.write(f"{i+1}. {text[:100]}...")
     
     # Create TF-IDF matrix
     with st.spinner("Creating search index..."):
         try:
             tfidf_matrix = vectorizer.fit_transform(texts)
+            
+            # Debug info
+            vocab_size = len(vectorizer.vocabulary_)
+            st.sidebar.success(f"✅ Index created: {vocab_size} terms, {len(texts)} documents")
+            
+            # Show some example terms
+            sample_terms = list(vectorizer.vocabulary_.keys())[:10]
+            st.sidebar.write(f"Sample terms: {', '.join(sample_terms)}")
+            
             return vectorizer, tfidf_matrix, texts
         except Exception as e:
             st.error(f"Failed to create search index: {e}")
+            st.error(f"Text samples: {texts[:3]}")
             return None, None, None
 
 def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf_matrix, texts, top_k: int = 10):
@@ -204,49 +247,84 @@ def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf
         return []
     
     try:
+        # Preprocess query similar to how documents were processed
+        query_processed = query.lower().strip()
+        
         # Create query vector
-        query_vector = vectorizer.transform([query])
+        query_vector = vectorizer.transform([query_processed])
         
         # Calculate similarities
         similarities = cosine_similarity(query_vector, tfidf_matrix).flatten()
         
-        # Get top results
-        top_indices = np.argsort(similarities)[::-1][:top_k]
+        # Debug: Show similarity scores
+        max_sim = similarities.max() if len(similarities) > 0 else 0
+        st.sidebar.write(f"Max similarity for '{query}': {max_sim:.3f}")
+        
+        # Get top results with lower threshold
+        top_indices = np.argsort(similarities)[::-1][:top_k * 2]  # Get more candidates
         
         results = []
         for idx in top_indices:
-            if similarities[idx] > 0.05:  # Minimum similarity threshold
+            if similarities[idx] > 0.01:  # Very low threshold
                 item = data_items[idx]
                 results.append({
                     'item': item,
                     'similarity': float(similarities[idx]),
-                    'text': texts[idx] if texts else ""
+                    'text': texts[idx] if texts else "",
+                    'debug_score': f"{similarities[idx]:.4f}"
                 })
         
-        return results
+        # Sort by similarity and return top results
+        results.sort(key=lambda x: x['similarity'], reverse=True)
+        return results[:top_k]
+        
     except Exception as e:
         st.error(f"Search error: {e}")
         return []
 
 def keyword_search(query: str, data_items: List[GISDataItem], top_k: int = 10):
-    """Fallback keyword search"""
+    """Enhanced keyword search with better matching"""
     query_lower = query.lower()
     query_words = re.findall(r'\w+', query_lower)
     
     results = []
     for item in data_items:
         score = 0
-        text_to_search = f"{item.title} {item.description} {' '.join(item.tags)} {item.type}".lower()
         
+        # Create searchable text
+        searchable_parts = [
+            item.title or "",
+            item.description or "",
+            item.snippet or "",
+            " ".join(item.tags or []),
+            item.type or "",
+            item.owner or ""
+        ]
+        text_to_search = " ".join(searchable_parts).lower()
+        
+        # Score calculation
         for word in query_words:
             if word in text_to_search:
-                score += text_to_search.count(word)
+                # Higher score for title matches
+                if word in (item.title or "").lower():
+                    score += 5
+                # Medium score for tag matches  
+                elif word in " ".join(item.tags or []).lower():
+                    score += 3
+                # Lower score for other matches
+                else:
+                    score += 1
+                
+                # Bonus for exact phrase matches
+                if query_lower in text_to_search:
+                    score += 10
         
         if score > 0:
             results.append({
                 'item': item,
-                'similarity': score / len(query_words),
-                'text': text_to_search[:200]
+                'similarity': score / max(len(query_words), 1),
+                'text': text_to_search[:200],
+                'debug_score': f"keyword:{score}"
             })
     
     # Sort by score
@@ -290,8 +368,11 @@ def display_search_result(result, index):
                 st.caption(f"📅 Modified: {item.modified[:10] if item.modified else 'Unknown'}")
         
         with col2:
-            # Similarity score
-            st.metric("Match Score", f"{similarity:.1%}")
+            # Similarity score with debug info
+            score_display = f"{similarity:.1%}"
+            if 'debug_score' in result:
+                score_display += f" ({result['debug_score']})"
+            st.metric("Match Score", score_display)
             
             # Action buttons
             st.markdown(f"[🔗 View in Portal]({item.url})")
@@ -332,6 +413,37 @@ def main():
         num_results = st.slider("Number of Results", 5, 50, 10)
         
         st.header("📊 Portal Stats")
+        if 'data_items' in locals():
+            total_items = len(data_items)
+            st.write(f"📦 **{total_items}** datasets")
+            
+            # Show data types
+            if data_items:
+                types = {}
+                for item in data_items:
+                    item_type = item.type or "Unknown"
+                    types[item_type] = types.get(item_type, 0) + 1
+                
+                st.write("**Data Types:**")
+                for dtype, count in sorted(types.items(), key=lambda x: x[1], reverse=True)[:5]:
+                    st.write(f"• {dtype}: {count}")
+        
+        # Debug section
+        st.header("🔧 Debug Info")
+        show_debug = st.checkbox("Show debug information")
+        
+        if show_debug and 'data_items' in locals():
+            st.write("**Sample dataset titles:**")
+            for i, item in enumerate(data_items[:5]):
+                st.write(f"{i+1}. {item.title}")
+                if item.tags:
+                    st.write(f"   Tags: {', '.join(item.tags[:3])}")
+            
+            # Search for census specifically
+            census_items = [item for item in data_items if 'census' in item.title.lower() or any('census' in tag.lower() for tag in item.tags)]
+            st.write(f"**Census datasets found: {len(census_items)}**")
+            for item in census_items[:3]:
+                st.write(f"• {item.title}")
         
     # Load data
     try:
