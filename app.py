@@ -12,6 +12,7 @@ import logging
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import os
+from urllib.parse import urljoin, urlparse
 
 # Configure page
 st.set_page_config(
@@ -37,80 +38,164 @@ class GISDataItem:
     modified: str
     type: str
     url: str
-    portal_url: str  # Link to the geoportal site
+    portal_url: str
     thumbnail: Optional[str] = None
     extent: Optional[Dict] = None
     num_views: Optional[int] = None
     snippet: Optional[str] = None
 
 class ArcGISPortalConnector:
-    """Handles connection and data retrieval from ArcGIS Portal"""
+    """Enhanced connector with multiple fallback methods"""
     
-    def __init__(self, portal_url: str):
-        self.base_portal_url = "https://geoportal.unl.edu/portal"
-        self.api_endpoints = [
-            f"{self.base_portal_url}/sharing/rest",
-            f"{self.base_portal_url}/sharing/rest/search",
-            f"{self.base_portal_url}/sharing/rest/content/items",
-        ]
+    def __init__(self, base_url: str = "https://geoportal.unl.edu"):
+        self.base_url = base_url
         self.session = requests.Session()
         self.session.timeout = 30
-        self.working_endpoint = None
         
-        # Test endpoints to find the working one
+        # Add common headers to appear more like a browser
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json, text/html, */*',
+            'Accept-Language': 'en-US,en;q=0.9'
+        })
+        
+        self.working_endpoint = None
+        self.api_type = None
         self.find_working_endpoint()
     
-    def find_working_endpoint(self):
-        """Test different API endpoints to find the working one"""
-        for endpoint in self.api_endpoints:
-            try:
-                # Test with a simple search
-                test_url = f"{endpoint}/search" if not endpoint.endswith('/search') else endpoint
-                test_params = {
-                    'q': '*',
-                    'f': 'json',
-                    'num': 1
-                }
-                
-                response = self.session.get(test_url, params=test_params, timeout=10)
-                if response.status_code == 200:
+    def test_endpoint(self, url: str, params: dict = None) -> tuple:
+        """Test an endpoint and return success status and data"""
+        try:
+            if params is None:
+                params = {'f': 'json'}
+            
+            response = self.session.get(url, params=params, timeout=15)
+            
+            if response.status_code == 200:
+                try:
                     data = response.json()
-                    if 'results' in data or 'items' in data:
-                        self.working_endpoint = test_url
-                        st.sidebar.success(f"✅ Connected to: {endpoint}")
-                        return
-                        
-            except Exception as e:
-                logger.debug(f"Endpoint {endpoint} failed: {e}")
-                continue
+                    return True, data, response.status_code
+                except json.JSONDecodeError:
+                    return False, response.text, response.status_code
+            else:
+                return False, f"HTTP {response.status_code}", response.status_code
+                
+        except Exception as e:
+            return False, str(e), None
+    
+    def find_working_endpoint(self):
+        """Try multiple endpoint patterns to find working API"""
         
-        st.sidebar.error("❌ Could not connect to API endpoint. Please check the API URL.")
-        st.sidebar.info("💡 Expected API format: https://yourportal.com/portal/sharing/rest")
+        # Different API endpoint patterns to try
+        endpoint_patterns = [
+            # Standard ArcGIS Portal patterns
+            f"{self.base_url}/portal/sharing/rest/search",
+            f"{self.base_url}/portal/sharing/rest/content/items", 
+            f"{self.base_url}/sharing/rest/search",
+            f"{self.base_url}/arcgis/sharing/rest/search",
+            f"{self.base_url}/server/rest/services",
+            f"{self.base_url}/rest/services",
+            
+            # Alternative patterns
+            f"{self.base_url}/portal/rest/services",
+            f"{self.base_url}/geoportal/rest/find/document",
+            f"{self.base_url}/catalog/search/resource/details.page",
+        ]
+        
+        # Test parameters for search endpoints
+        test_params = [
+            {'q': '*', 'f': 'json', 'num': 1},
+            {'f': 'json', 'num': 1},
+            {'q': 'census', 'f': 'json', 'num': 1},
+            {'searchText': '*', 'f': 'json', 'max': 1},
+        ]
+        
+        st.sidebar.write("**🔍 Testing API endpoints...**")
+        
+        for endpoint in endpoint_patterns:
+            for params in test_params:
+                success, data, status_code = self.test_endpoint(endpoint, params)
+                
+                if success and isinstance(data, dict):
+                    # Check if this looks like a valid response
+                    if ('results' in data or 'items' in data or 'services' in data or 
+                        'records' in data or 'documents' in data):
+                        
+                        self.working_endpoint = endpoint
+                        self.api_type = "search"
+                        st.sidebar.success(f"✅ Found working endpoint!")
+                        st.sidebar.write(f"URL: {endpoint}")
+                        st.sidebar.write(f"Params: {params}")
+                        
+                        # Store the working params
+                        self.working_params = params
+                        return
+        
+        st.sidebar.error("❌ No working API endpoints found")
+        st.sidebar.write("**Trying alternative approaches...**")
+        
+        # Try to get portal info
+        info_endpoints = [
+            f"{self.base_url}/portal/sharing/rest/portals/info",
+            f"{self.base_url}/sharing/rest/portals/info",
+            f"{self.base_url}/arcgis/sharing/rest/portals/info"
+        ]
+        
+        for endpoint in info_endpoints:
+            success, data, status_code = self.test_endpoint(endpoint)
+            if success:
+                st.sidebar.info(f"ℹ️ Portal info available at: {endpoint}")
+                break
     
     def search_content(self, query: str = "*", num: int = 100, start: int = 1) -> Dict:
-        """Search for content in the portal"""
+        """Search for content using the working endpoint"""
         if not self.working_endpoint:
             return {'results': [], 'total': 0}
         
-        params = {
-            'q': query,
-            'num': min(num, 100),
-            'start': start,
-            'f': 'json',
-            'sortField': 'modified',
-            'sortOrder': 'desc'
-        }
+        # Use the working parameters as base
+        params = self.working_params.copy()
+        
+        # Update with search parameters
+        if 'q' in params:
+            params['q'] = query
+        elif 'searchText' in params:
+            params['searchText'] = query
+        
+        # Update pagination
+        if 'num' in params:
+            params['num'] = min(num, 100)
+            params['start'] = start
+        elif 'max' in params:
+            params['max'] = min(num, 100)
+            params['start'] = start
         
         try:
             response = self.session.get(self.working_endpoint, params=params, timeout=30)
+            
             if response.status_code == 200:
                 result = response.json()
                 
-                # Handle different response formats
+                # Normalize response format
                 if 'results' in result:
-                    return result
+                    return {
+                        'results': result['results'],
+                        'total': result.get('total', len(result['results']))
+                    }
                 elif 'items' in result:
-                    return {'results': result['items'], 'total': len(result['items'])}
+                    return {
+                        'results': result['items'],
+                        'total': len(result['items'])
+                    }
+                elif 'records' in result:
+                    return {
+                        'results': result['records'],
+                        'total': result.get('totalResults', len(result['records']))
+                    }
+                elif isinstance(result, list):
+                    return {
+                        'results': result,
+                        'total': len(result)
+                    }
                     
         except Exception as e:
             logger.error(f"Search failed: {e}")
@@ -118,40 +203,135 @@ class ArcGISPortalConnector:
         return {'results': [], 'total': 0}
     
     def get_all_content(self, max_items: int = 1000) -> List[Dict]:
-        """Get all available content from the portal"""
+        """Get all available content with progress tracking"""
         all_items = []
         start = 1
-        num_per_request = 100
+        num_per_request = 50  # Smaller batches for better reliability
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        while len(all_items) < max_items:
-            status_text.text(f"Loading data... {len(all_items)} items retrieved")
-            
-            result = self.search_content(query="*", num=num_per_request, start=start)
-            
-            if 'results' not in result or not result['results']:
+        # Try different search strategies
+        search_terms = ["*", "", "type:*", "census", "map", "data"]
+        
+        for search_term in search_terms:
+            if all_items:  # If we got data, stop trying
                 break
                 
-            all_items.extend(result['results'])
+            status_text.text(f"Trying search term: '{search_term}'...")
+            current_start = 1
+            items_from_this_search = []
             
-            # Update progress
-            if 'total' in result and result['total'] > 0:
-                progress = min(len(all_items) / min(result['total'], max_items), 1.0)
+            while len(items_from_this_search) < max_items:
+                result = self.search_content(
+                    query=search_term, 
+                    num=num_per_request, 
+                    start=current_start
+                )
+                
+                if not result['results']:
+                    break
+                
+                items_from_this_search.extend(result['results'])
+                
+                # Update progress
+                progress = min(len(items_from_this_search) / max_items, 1.0)
                 progress_bar.progress(progress)
-            
-            # Check if we've got all available items
-            if len(result['results']) < num_per_request:
-                break
+                status_text.text(f"Found {len(items_from_this_search)} items with '{search_term}'")
                 
-            start += num_per_request
-            time.sleep(0.1)
+                # Check if we got fewer results than requested (end of results)
+                if len(result['results']) < num_per_request:
+                    break
+                    
+                current_start += num_per_request
+                time.sleep(0.2)  # Be nice to the server
+            
+            if items_from_this_search:
+                all_items = items_from_this_search
+                st.sidebar.success(f"✅ Loaded {len(all_items)} items using search term: '{search_term}'")
+                break
+        
+        # If still no results, try sample data
+        if not all_items:
+            st.warning("⚠️ Could not load data from API. Using sample data for demonstration.")
+            all_items = self.create_sample_data()
         
         progress_bar.progress(1.0)
-        status_text.text(f"Loaded {len(all_items)} items successfully!")
+        status_text.text(f"✅ Total items loaded: {len(all_items)}")
         
         return all_items[:max_items]
+    
+    def create_sample_data(self) -> List[Dict]:
+        """Create sample data for demonstration when API fails"""
+        sample_data = [
+            {
+                'id': 'sample_census_001',
+                'title': 'Nebraska Census Population Data 2020',
+                'description': 'Demographic and population statistics from the 2020 US Census for Nebraska counties and census tracts. Includes total population, age distribution, race and ethnicity data.',
+                'snippet': 'Census population demographics for Nebraska',
+                'tags': ['census', 'population', 'demographics', 'nebraska', '2020'],
+                'owner': 'UNL Libraries',
+                'created': '1640995200000',
+                'modified': '1672531200000',
+                'type': 'Feature Service',
+                'numViews': 1250,
+                'thumbnail': 'census_thumb.png'
+            },
+            {
+                'id': 'sample_agri_002', 
+                'title': 'Nebraska Agricultural Land Use',
+                'description': 'Comprehensive agricultural land use data for Nebraska including crop types, irrigation patterns, and land cover classifications. Data collected from satellite imagery and field surveys.',
+                'snippet': 'Agricultural land use and crop data',
+                'tags': ['agriculture', 'land use', 'crops', 'farming', 'nebraska'],
+                'owner': 'UNL Extension',
+                'created': '1609459200000',
+                'modified': '1675123200000',
+                'type': 'Map Service',
+                'numViews': 890,
+                'thumbnail': 'agri_thumb.png'
+            },
+            {
+                'id': 'sample_elevation_003',
+                'title': 'Nebraska Digital Elevation Model (DEM)',
+                'description': 'High-resolution digital elevation model covering the state of Nebraska. 10-meter resolution DEM derived from LiDAR data, suitable for topographic analysis and watershed modeling.',
+                'snippet': 'Digital elevation model topography data',
+                'tags': ['elevation', 'DEM', 'topography', 'lidar', 'terrain'],
+                'owner': 'UNL Geography',
+                'created': '1577836800000',
+                'modified': '1671667200000',
+                'type': 'Image Service',
+                'numViews': 2100,
+                'thumbnail': 'dem_thumb.png'
+            },
+            {
+                'id': 'sample_water_004',
+                'title': 'Nebraska Water Resources',
+                'description': 'Water resources data including rivers, lakes, reservoirs, and groundwater information. Includes water quality measurements and flow data for major water bodies.',
+                'snippet': 'Water resources and hydrology data',
+                'tags': ['water', 'hydrology', 'rivers', 'lakes', 'groundwater'],
+                'owner': 'UNL Water Sciences',
+                'created': '1596240000000',
+                'modified': '1673740800000',
+                'type': 'Feature Service',
+                'numViews': 750,
+                'thumbnail': 'water_thumb.png'
+            },
+            {
+                'id': 'sample_transport_005',
+                'title': 'Nebraska Transportation Networks',
+                'description': 'Comprehensive transportation network data including roads, highways, railroads, and airports. Road data includes functional classification and traffic volume where available.',
+                'snippet': 'Transportation and road network data',
+                'tags': ['transportation', 'roads', 'highways', 'railroads', 'infrastructure'],
+                'owner': 'UNL Engineering',
+                'created': '1588291200000',
+                'modified': '1674950400000',
+                'type': 'Feature Service',
+                'numViews': 640,
+                'thumbnail': 'transport_thumb.png'
+            }
+        ]
+        
+        return sample_data
 
 # OpenAI Integration (optional)
 def setup_openai():
@@ -159,18 +339,17 @@ def setup_openai():
     try:
         import openai
         api_key = st.sidebar.text_input("OpenAI API Key (optional)", type="password", 
-                                      help="Enter your OpenAI API key for enhanced search")
+                                      help="Enter your OpenAI API key for AI-enhanced search")
         if api_key:
             openai.api_key = api_key
             return True, openai
         else:
-            # Try to get from environment
             env_key = os.getenv('OPENAI_API_KEY')
             if env_key:
                 openai.api_key = env_key
                 return True, openai
     except ImportError:
-        st.sidebar.info("💡 Install openai package for AI-enhanced search features")
+        st.sidebar.info("💡 Install 'openai' package for AI-enhanced features")
         return False, None
     
     return False, None
@@ -184,18 +363,17 @@ def enhance_query_with_ai(query: str, openai_module) -> str:
         response = openai_module.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": """You are a GIS and geospatial data expert. Given a user's search query, expand it with relevant GIS terms and concepts that would help find geospatial datasets.
+                {"role": "system", "content": """You are a GIS expert. Expand search queries with relevant geospatial terms.
 
-For example:
-- "population" → "population demographics census people residents statistics inhabitants"
-- "water" → "water hydrology rivers lakes streams watersheds precipitation"
+Examples:
+- "population" → "population demographics census people residents statistics"
+- "water" → "water hydrology rivers lakes streams watersheds"
 - "agriculture" → "agriculture farming crops land use cultivation"
-- "elevation" → "elevation topography DEM digital elevation model terrain"
 
-Return only the expanded search terms as a single line, separated by spaces."""},
-                {"role": "user", "content": f"Expand this geospatial search query: {query}"}
+Return expanded terms in one line."""},
+                {"role": "user", "content": f"Expand: {query}"}
             ],
-            max_tokens=100,
+            max_tokens=50,
             temperature=0.3
         )
         
@@ -206,90 +384,49 @@ Return only the expanded search terms as a single line, separated by spaces."""}
         st.sidebar.warning(f"AI enhancement failed: {e}")
         return query
 
-def chat_with_user(user_message: str, search_results: List, openai_module) -> str:
-    """Chat with user about search results using OpenAI"""
-    if not openai_module:
-        return "I'd be happy to help you find GIS data! However, OpenAI integration is not available right now. Try searching for specific terms related to your research needs."
-        
-    try:
-        # Prepare context about the search results
-        results_context = ""
-        if search_results:
-            results_context = "Available datasets found:\n"
-            for i, result in enumerate(search_results[:5]):
-                item = result['item']
-                results_context += f"{i+1}. {item.title} - {item.type}\n"
-                if item.description:
-                    results_context += f"   Description: {item.description[:100]}...\n"
-        
-        response = openai_module.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": f"""You are a helpful GIS data assistant for the University of Nebraska-Lincoln Geoportal. 
-                
-Help users find and understand geospatial data. Be conversational and helpful.
-
-Current search context: {results_context}
-
-Guidelines:
-- Provide specific recommendations about the datasets found
-- Explain what types of GIS data might be useful for their needs  
-- Suggest related searches if current results aren't perfect
-- Be encouraging and helpful"""},
-                {"role": "user", "content": user_message}
-            ],
-            max_tokens=300,
-            temperature=0.7
-        )
-        
-        return response.choices[0].message.content.strip()
-        
-    except Exception as e:
-        return f"I'd be happy to help you find GIS data! However, I'm having trouble accessing my AI capabilities right now. Try searching for specific terms related to your research needs."
-
 @st.cache_resource
 def load_tfidf_vectorizer():
-    """Load the TF-IDF vectorizer (cached)"""
+    """Load TF-IDF vectorizer"""
     try:
-        # Minimal stop words to preserve GIS terminology
-        custom_stop_words = ['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by']
-        
         return TfidfVectorizer(
-            max_features=10000,
-            stop_words=custom_stop_words,
-            ngram_range=(1, 3),
+            max_features=5000,
+            stop_words=['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'],
+            ngram_range=(1, 2),
             lowercase=True,
             min_df=1,
-            max_df=0.95,
-            token_pattern=r'\b[a-zA-Z][a-zA-Z0-9_]*\b'
+            max_df=0.9
         )
     except Exception as e:
         st.error(f"Failed to load vectorizer: {e}")
         return None
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=1800)  # Cache for 30 minutes
 def load_portal_data():
-    """Load and process data from the portal (cached)"""
-    portal = ArcGISPortalConnector("https://geoportal.unl.edu/portal/sharing/rest")
+    """Load and process data from portal"""
+    portal = ArcGISPortalConnector()
     
     with st.spinner("Loading data from UNL Geoportal..."):
-        raw_items = portal.get_all_content(max_items=2000)
+        raw_items = portal.get_all_content(max_items=1000)
+    
+    if not raw_items:
+        st.error("No data could be loaded from the portal")
+        return []
     
     # Convert to GISDataItem objects
     data_items = []
     for item in raw_items:
         try:
-            item_id = item.get('id', '')
+            item_id = item.get('id', f"unknown_{len(data_items)}")
             
             gis_item = GISDataItem(
                 id=item_id,
-                title=item.get('title', 'Untitled'),
+                title=item.get('title', 'Untitled Dataset'),
                 description=item.get('description', '') or item.get('snippet', ''),
                 tags=item.get('tags', []),
                 owner=item.get('owner', 'Unknown'),
                 created=item.get('created', ''),
                 modified=item.get('modified', ''),
-                type=item.get('type', 'Unknown'),
+                type=item.get('type', 'Dataset'),
                 url=f"https://geoportal.unl.edu/portal/home/item.html?id={item_id}",
                 portal_url=f"https://geoportal.unl.edu/portal/apps/sites/#/unl-geoportal/datasets/{item_id}",
                 thumbnail=item.get('thumbnail'),
@@ -298,79 +435,68 @@ def load_portal_data():
                 snippet=item.get('snippet', '')
             )
             data_items.append(gis_item)
+            
         except Exception as e:
-            logger.warning(f"Error processing item {item.get('id', 'unknown')}: {e}")
+            logger.warning(f"Error processing item: {e}")
             continue
     
     return data_items
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=1800)
 def create_search_index(data_items):
-    """Create TF-IDF search index for all data items (cached)"""
+    """Create search index from data items"""
     vectorizer = load_tfidf_vectorizer()
-    if not vectorizer:
+    if not vectorizer or not data_items:
         return None, None, None
     
-    if not data_items:
-        st.error("No data items to index!")
-        return None, None, None
-    
-    # Prepare text for indexing - focus on BOTH title and description as requested
+    # Create searchable text focusing on title and description
     texts = []
     for item in data_items:
         text_parts = []
         
-        # Title (important)
+        # Title (high importance)
         if item.title:
             text_parts.append(item.title)
         
-        # Description (very important - this is what you specifically requested)
+        # Description (high importance - as you requested)
         description = item.description or item.snippet or ""
         if description:
-            # Clean and add full description
-            clean_description = re.sub(r'<[^>]+>', '', description)  # Remove HTML tags
-            clean_description = re.sub(r'\s+', ' ', clean_description)  # Normalize whitespace
-            text_parts.append(clean_description)
+            clean_desc = re.sub(r'<[^>]+>', '', description)  # Remove HTML
+            clean_desc = re.sub(r'\s+', ' ', clean_desc).strip()  # Clean whitespace
+            text_parts.append(clean_desc)
         
-        # Tags (important for categorization)
+        # Tags (medium importance)
         if item.tags:
             text_parts.append(" ".join(item.tags))
         
-        # Type for additional context
+        # Type (low importance)
         if item.type:
             text_parts.append(item.type)
         
-        # Join all parts with title and description getting the most weight
-        text = " ".join([part for part in text_parts if part.strip()])
+        # Combine all text
+        combined_text = " ".join([part for part in text_parts if part.strip()])
         
-        # Ensure we have some text
-        if not text.strip():
-            text = f"untitled {item.type or 'dataset'} {item.id}"
+        if not combined_text.strip():
+            combined_text = f"dataset {item.type or 'unknown'} {item.id}"
         
-        texts.append(text)
-    
-    # Debug: Show some sample texts
-    if st.sidebar.checkbox("Show debug info", value=False):
-        st.sidebar.write("**Sample indexed content:**")
-        for i, text in enumerate(texts[:3]):
-            st.sidebar.write(f"{i+1}. {text[:200]}...")
+        texts.append(combined_text)
     
     # Create TF-IDF matrix
-    with st.spinner("Creating search index..."):
-        try:
+    try:
+        with st.spinner("Building search index..."):
             tfidf_matrix = vectorizer.fit_transform(texts)
             
-            # Debug info
-            vocab_size = len(vectorizer.vocabulary_)
-            st.sidebar.success(f"✅ Index created: {vocab_size} terms, {len(texts)} documents")
-            
-            return vectorizer, tfidf_matrix, texts
-        except Exception as e:
-            st.error(f"Failed to create search index: {e}")
-            return None, None, None
+        vocab_size = len(vectorizer.vocabulary_)
+        st.sidebar.success(f"✅ Search index ready: {vocab_size} terms, {len(texts)} documents")
+        
+        return vectorizer, tfidf_matrix, texts
+        
+    except Exception as e:
+        st.error(f"Failed to create search index: {e}")
+        return None, None, None
 
 def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf_matrix, texts, top_k: int = 10, use_ai: bool = False, openai_module=None):
-    """Perform semantic search using TF-IDF with optional AI enhancement"""
+    """Perform semantic search using TF-IDF"""
     if not vectorizer or tfidf_matrix is None:
         return []
     
@@ -387,17 +513,12 @@ def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf
         # Calculate similarities
         similarities = cosine_similarity(query_vector, tfidf_matrix).flatten()
         
-        # Debug info
-        if st.sidebar.checkbox("Show debug info", value=False):
-            max_sim = similarities.max() if len(similarities) > 0 else 0
-            st.sidebar.write(f"**Max similarity:** {max_sim:.3f}")
-        
         # Get top results
         top_indices = np.argsort(similarities)[::-1][:top_k * 2]
         
         results = []
         for idx in top_indices:
-            if similarities[idx] > 0.01:  # Low threshold to catch more results
+            if similarities[idx] > 0.01:  # Low threshold
                 item = data_items[idx]
                 results.append({
                     'item': item,
@@ -414,7 +535,7 @@ def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf
         return []
 
 def keyword_search(query: str, data_items: List[GISDataItem], top_k: int = 10):
-    """Enhanced keyword search focusing on both title and descriptions as requested"""
+    """Enhanced keyword search focusing on title and description"""
     query_lower = query.lower()
     query_words = re.findall(r'\w+', query_lower)
     
@@ -422,30 +543,26 @@ def keyword_search(query: str, data_items: List[GISDataItem], top_k: int = 10):
     for item in data_items:
         score = 0
         
-        # Get text from title and description (as specifically requested)
         title = (item.title or "").lower()
         description = (item.description or item.snippet or "").lower()
         tags = " ".join(item.tags or []).lower()
         
-        # Weighted scoring with equal weight for title and description
+        # Scoring with emphasis on title and description
         for word in query_words:
-            # Title and description get equal high weight
             if word in title:
-                score += 4
+                score += 5
             if word in description:
-                score += 4
-            # Tags get lower weight
+                score += 5
             if word in tags:
                 score += 2
         
-        # Bonus for exact phrase matches
+        # Phrase matching bonus
         if query_lower in description:
-            score += 10
+            score += 15
         elif query_lower in title:
-            score += 8
+            score += 10
         
         if score > 0:
-            # Prepare matched content showing both title and description
             matched_content = f"Title: {item.title}\nDescription: {description[:250]}..."
             results.append({
                 'item': item,
@@ -469,64 +586,60 @@ def display_search_result(result, index):
             # Title with links
             st.markdown(f"### {item.title}")
             
-            # Links to different views
+            # Links
             link_col1, link_col2 = st.columns(2)
             with link_col1:
                 st.markdown(f"🔗 [View Details]({item.url})")
             with link_col2:
                 st.markdown(f"📊 [Explore Dataset]({item.portal_url})")
             
-            # Type badge
+            # Type and metadata
             st.markdown(f"**Type:** `{item.type}`")
             
-            # Description/Summary (as specifically requested)
+            # Description (emphasis as requested)
             description = item.description or item.snippet or "No description available"
             if description:
-                # Show more of the description since it's important for context
-                full_desc = description[:600] + "..." if len(description) > 600 else description
                 st.write("**Description:**")
-                st.write(full_desc)
+                st.write(description[:500] + "..." if len(description) > 500 else description)
             
-            # Matched content preview
+            # Matched content
             if 'matched_content' in result and result['matched_content']:
-                with st.expander("🎯 Matched content preview"):
+                with st.expander("🎯 Matched content"):
                     st.write(result['matched_content'])
             
             # Tags
             if item.tags:
-                tags_html = " ".join([f'<span style="background-color: #e6f3ff; padding: 2px 6px; border-radius: 3px; font-size: 12px; margin: 2px;">{tag}</span>' for tag in item.tags[:10]])
+                tags_html = " ".join([f'<span style="background-color: #e6f3ff; padding: 2px 6px; border-radius: 3px; font-size: 12px; margin: 2px;">{tag}</span>' for tag in item.tags[:8]])
                 st.markdown(f"**Tags:** {tags_html}", unsafe_allow_html=True)
             
-            # Metadata
-            col_meta1, col_meta2, col_meta3 = st.columns(3)
-            with col_meta1:
+            # Metadata row
+            meta_col1, meta_col2, meta_col3 = st.columns(3)
+            with meta_col1:
                 st.caption(f"👤 Owner: {item.owner}")
-            with col_meta2:
+            with meta_col2:
                 if item.num_views:
                     st.caption(f"👁️ Views: {item.num_views}")
-            with col_meta3:
+            with meta_col3:
                 st.caption(f"📅 Modified: {item.modified[:10] if item.modified else 'Unknown'}")
         
         with col2:
-            # Similarity score
+            # Match score
             st.metric("Match Score", f"{similarity:.1%}")
             
-            # Thumbnail if available
+            # Thumbnail placeholder
             if item.thumbnail:
-                thumbnail_url = f"https://geoportal.unl.edu/portal/sharing/rest/content/items/{item.id}/info/{item.thumbnail}"
-                try:
-                    st.image(thumbnail_url, width=150)
-                except:
-                    st.write("📷 Thumbnail available")
+                st.write("📷 Thumbnail available")
+            else:
+                st.write("📄 No preview")
         
         st.divider()
 
 def main():
-    """Main Streamlit application"""
+    """Main application"""
     
     # Header
     st.title("🗺️ UNL Geoportal Intelligent Search")
-    st.markdown("Search for geospatial data using natural language with AI assistance!")
+    st.markdown("Search for geospatial data using natural language queries!")
     
     # Sidebar
     with st.sidebar:
@@ -534,140 +647,125 @@ def main():
         has_openai, openai_module = setup_openai()
         
         if has_openai:
-            st.success("✅ ChatGPT integration active")
-            
-            # Chat interface
-            st.subheader("💬 Ask me about GIS data")
-            user_message = st.text_area("What can I help you find?", placeholder="e.g., What kind of population data do you have?")
-            
+            st.success("✅ AI features available")
         else:
-            st.info("💡 Add OpenAI API key for AI chat features")
-            user_message = None
+            st.info("💡 Add OpenAI API key for enhanced search")
         
         st.header("🔧 Settings")
         search_method = st.selectbox(
             "Search Method",
-            ["AI-Enhanced Search", "Semantic Search", "Keyword Search"],
-            help="AI-Enhanced uses ChatGPT to improve your search"
+            ["Keyword Search", "Semantic Search", "AI-Enhanced Search"],
+            help="Choose your search strategy"
         )
         
-        num_results = st.slider("Number of Results", 5, 50, 10)
+        num_results = st.slider("Number of Results", 5, 25, 10)
         
-        st.header("📊 Portal Stats")
+        st.header("📊 System Status")
     
     # Load data
     try:
         data_items = load_portal_data()
+        
+        if not data_items:
+            st.error("❌ No data available. Please check the API connection.")
+            st.info("💡 The diagnostic tool can help identify connection issues.")
+            st.stop()
+        
         st.sidebar.success(f"✅ {len(data_items)} datasets loaded")
         
-        # Show some examples of loaded data
-        if data_items:
-            if st.sidebar.checkbox("Show sample datasets", value=False):
-                st.sidebar.write("**Sample datasets:**")
-                for i, item in enumerate(data_items[:3]):
-                    st.sidebar.write(f"{i+1}. {item.title[:50]}...")
-            
-            # Check for census data specifically
-            census_items = [item for item in data_items if 'census' in item.title.lower() or 
-                          'census' in (item.description or '').lower() or
-                          any('census' in tag.lower() for tag in item.tags)]
-            if census_items:
-                st.sidebar.success(f"🎯 Found {len(census_items)} census-related datasets")
-        
-        # Create search index
+        # Create search index for semantic/AI search
         vectorizer, tfidf_matrix, texts = None, None, None
-        if search_method in ["AI-Enhanced Search", "Semantic Search"]:
+        if search_method in ["Semantic Search", "AI-Enhanced Search"]:
             vectorizer, tfidf_matrix, texts = create_search_index(data_items)
-            if vectorizer is not None:
-                st.sidebar.success("✅ Search index ready")
-            else:
-                st.sidebar.error("❌ Search index failed, using keyword search")
+            
+            if vectorizer is None:
+                st.sidebar.warning("⚠️ Falling back to keyword search")
                 search_method = "Keyword Search"
         
     except Exception as e:
-        st.error(f"Failed to load portal data: {e}")
+        st.error(f"Failed to load data: {e}")
+        st.info("💡 Try running the diagnostic tool to identify issues.")
         st.stop()
     
     # Search interface
-    st.header("🔍 Search")
+    st.header("🔍 Search Interface")
     
-    # Search input
     query = st.text_input(
         "What geospatial data are you looking for?",
-        placeholder="e.g., population data, census demographics, agricultural land use, elevation maps...",
-        help="Describe what you need in plain English. The search will look through both titles and descriptions."
+        placeholder="e.g., population census data, agricultural land use, elevation maps...",
+        help="Describe what you need - the search looks through titles and descriptions"
     )
     
-    # Search and display results
+    # Perform search
     if query and query.strip():
         with st.spinner("Searching..."):
-            # Perform search based on method
+            
             if search_method == "AI-Enhanced Search" and vectorizer is not None:
-                results = semantic_search(query, data_items, vectorizer, tfidf_matrix, texts, num_results, use_ai=has_openai, openai_module=openai_module)
+                results = semantic_search(query, data_items, vectorizer, tfidf_matrix, texts, 
+                                        num_results, use_ai=has_openai, openai_module=openai_module)
             elif search_method == "Semantic Search" and vectorizer is not None:
-                results = semantic_search(query, data_items, vectorizer, tfidf_matrix, texts, num_results, use_ai=False)
+                results = semantic_search(query, data_items, vectorizer, tfidf_matrix, texts, 
+                                        num_results, use_ai=False)
             else:
                 results = keyword_search(query, data_items, num_results)
             
-            # Display results
+        # Display results
+        if results:
+            st.success(f"Found {len(results)} relevant datasets")
+            
+            # Export functionality
             if results:
-                st.success(f"Found {len(results)} relevant datasets")
+                results_df = pd.DataFrame([{
+                    'Title': r['item'].title,
+                    'Description': (r['item'].description or r['item'].snippet or "")[:200],
+                    'Type': r['item'].type,
+                    'Owner': r['item'].owner,
+                    'Portal_URL': r['item'].portal_url,
+                    'Tags': ', '.join(r['item'].tags),
+                    'Match_Score': f"{r['similarity']:.3f}"
+                } for r in results])
                 
-                # Export option
-                if len(results) > 0:
-                    results_df = pd.DataFrame([{
-                        'Title': r['item'].title,
-                        'Type': r['item'].type,
-                        'Owner': r['item'].owner,
-                        'Portal_URL': r['item'].portal_url,
-                        'Description': (r['item'].description or r['item'].snippet or "")[:300],
-                        'Tags': ', '.join(r['item'].tags),
-                        'Match_Score': f"{r['similarity']:.3f}"
-                    } for r in results])
-                    
-                    st.download_button(
-                        "📥 Export Results",
-                        data=results_df.to_csv(index=False),
-                        file_name=f"unl_geoportal_search_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv"
-                    )
+                csv_data = results_df.to_csv(index=False)
+                st.download_button(
+                    "📥 Export Results (CSV)",
+                    data=csv_data,
+                    file_name=f"unl_geoportal_search_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+            
+            # Display each result
+            for i, result in enumerate(results):
+                display_search_result(result, i)
                 
-                # Display results
-                for i, result in enumerate(results):
-                    display_search_result(result, i)
-                    
-                # AI Chat about results
-                if has_openai and user_message:
-                    with st.expander("🤖 AI Assistant Response"):
-                        ai_response = chat_with_user(user_message, results, openai_module)
-                        st.write(ai_response)
-                        
-            else:
-                st.warning("No results found. Try different keywords or check if the API connection is working properly.")
-                st.info("💡 Try broader terms like 'population', 'water', 'agriculture', or 'elevation'")
+        else:
+            st.warning("No results found. Try different keywords or broader terms.")
+            st.info("💡 Try searches like: 'population', 'agriculture', 'water', 'elevation'")
     
-    # Example searches
-    st.header("💡 Try These Searches")
-    example_col1, example_col2, example_col3 = st.columns(3)
+    # Quick search examples
+    st.header("💡 Example Searches")
     
-    with example_col1:
-        if st.button("🏛️ population"):
-            st.rerun()
+    col1, col2, col3, col4 = st.columns(4)
     
-    with example_col2:
-        if st.button("🌾 agriculture"):
-            st.rerun()
+    example_queries = [
+        ("🏛️ Population", "population census demographics"),
+        ("🌾 Agriculture", "agriculture farming crops land use"),
+        ("💧 Water", "water hydrology rivers lakes"),
+        ("🏔️ Elevation", "elevation topography DEM terrain")
+    ]
     
-    with example_col3:
-        if st.button("🗻 elevation"):
-            st.rerun()
+    for i, (button_text, example_query) in enumerate(example_queries):
+        col = [col1, col2, col3, col4][i]
+        with col:
+            if st.button(button_text, key=f"example_{i}"):
+                st.experimental_set_query_params(q=example_query)
+                st.experimental_rerun()
     
     # Footer
     st.markdown("---")
     st.markdown("""
-    <div style='text-align: center'>
+    <div style='text-align: center; color: #666;'>
         <p>🏛️ <a href='https://geoportal.unl.edu/portal/apps/sites/#/unl-geoportal' target='_blank'>UNL Geoportal</a> | 
-        🤖 Powered by AI & Semantic Search | 
+        🔍 Intelligent Search System | 
         📚 <a href='https://libraries.unl.edu/' target='_blank'>UNL Libraries</a></p>
     </div>
     """, unsafe_allow_html=True)
