@@ -418,20 +418,33 @@ def load_portal_data():
         try:
             item_id = item.get('id', f"unknown_{len(data_items)}")
             
+            # Handle different date formats
+            def safe_date_convert(date_value):
+                if not date_value:
+                    return ''
+                try:
+                    if isinstance(date_value, (int, float)):
+                        # Convert timestamp (milliseconds) to string
+                        from datetime import datetime
+                        return datetime.fromtimestamp(date_value / 1000).isoformat()
+                    return str(date_value)
+                except:
+                    return str(date_value) if date_value else ''
+            
             gis_item = GISDataItem(
                 id=item_id,
                 title=item.get('title', 'Untitled Dataset'),
                 description=item.get('description', '') or item.get('snippet', ''),
-                tags=item.get('tags', []),
+                tags=item.get('tags', []) if isinstance(item.get('tags'), list) else [],
                 owner=item.get('owner', 'Unknown'),
-                created=item.get('created', ''),
-                modified=item.get('modified', ''),
+                created=safe_date_convert(item.get('created')),
+                modified=safe_date_convert(item.get('modified')),
                 type=item.get('type', 'Dataset'),
                 url=f"https://geoportal.unl.edu/portal/home/item.html?id={item_id}",
                 portal_url=f"https://geoportal.unl.edu/portal/apps/sites/#/unl-geoportal/datasets/{item_id}",
                 thumbnail=item.get('thumbnail'),
                 extent=item.get('extent'),
-                num_views=item.get('numViews', 0),
+                num_views=item.get('numViews', 0) if isinstance(item.get('numViews'), (int, float)) else 0,
                 snippet=item.get('snippet', '')
             )
             data_items.append(gis_item)
@@ -466,8 +479,13 @@ def create_search_index(data_items):
             text_parts.append(clean_desc)
         
         # Tags (medium importance)
-        if item.tags:
-            text_parts.append(" ".join(item.tags))
+        if item.tags and isinstance(item.tags, list):
+            try:
+                clean_tags = [str(tag) for tag in item.tags if tag and str(tag).strip()]
+                if clean_tags:
+                    text_parts.append(" ".join(clean_tags))
+            except:
+                pass  # Skip problematic tags
         
         # Type (low importance)
         if item.type:
@@ -608,19 +626,41 @@ def display_search_result(result, index):
                     st.write(result['matched_content'])
             
             # Tags
-            if item.tags:
-                tags_html = " ".join([f'<span style="background-color: #e6f3ff; padding: 2px 6px; border-radius: 3px; font-size: 12px; margin: 2px;">{tag}</span>' for tag in item.tags[:8]])
-                st.markdown(f"**Tags:** {tags_html}", unsafe_allow_html=True)
+            if item.tags and isinstance(item.tags, list):
+                try:
+                    tags_html = " ".join([f'<span style="background-color: #e6f3ff; padding: 2px 6px; border-radius: 3px; font-size: 12px; margin: 2px;">{str(tag)}</span>' for tag in item.tags[:8] if tag])
+                    st.markdown(f"**Tags:** {tags_html}", unsafe_allow_html=True)
+                except Exception as e:
+                    st.caption(f"**Tags:** {', '.join([str(tag) for tag in item.tags[:8] if tag])}")
             
             # Metadata row
             meta_col1, meta_col2, meta_col3 = st.columns(3)
             with meta_col1:
                 st.caption(f"👤 Owner: {item.owner}")
             with meta_col2:
-                if item.num_views:
-                    st.caption(f"👁️ Views: {item.num_views}")
+                try:
+                    if item.num_views and isinstance(item.num_views, (int, float)) and item.num_views > 0:
+                        st.caption(f"👁️ Views: {int(item.num_views)}")
+                    else:
+                        st.caption("👁️ Views: N/A")
+                except:
+                    st.caption("👁️ Views: N/A")
             with meta_col3:
-                st.caption(f"📅 Modified: {item.modified[:10] if item.modified else 'Unknown'}")
+                # Handle different date formats (timestamp vs string)
+                modified_date = "Unknown"
+                if item.modified:
+                    try:
+                        if isinstance(item.modified, (int, float)):
+                            # Convert timestamp to readable date
+                            from datetime import datetime
+                            modified_date = datetime.fromtimestamp(item.modified / 1000).strftime('%Y-%m-%d')
+                        elif isinstance(item.modified, str) and len(item.modified) >= 10:
+                            modified_date = item.modified[:10]
+                        else:
+                            modified_date = str(item.modified)
+                    except:
+                        modified_date = "Unknown"
+                st.caption(f"📅 Modified: {modified_date}")
         
         with col2:
             # Match score
