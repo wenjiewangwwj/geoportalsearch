@@ -147,8 +147,8 @@ class ArcGISPortalConnector:
                 st.sidebar.info(f"ℹ️ Portal info available at: {endpoint}")
                 break
     
-    def search_content(self, query: str = "*", num: int = 100, start: int = 1) -> Dict:
-        """Search for content using the working endpoint"""
+    def search_content(self, query: str = "*", num: int = 100, start: int = 1, group_filter: str = None) -> Dict:
+        """Search for content using the working endpoint with optional group filtering"""
         if not self.working_endpoint:
             return {'results': [], 'total': 0}
         
@@ -157,9 +157,16 @@ class ArcGISPortalConnector:
         
         # Update with search parameters
         if 'q' in params:
-            params['q'] = query
+            # Add group filter to the query if specified
+            if group_filter:
+                params['q'] = f'({query}) AND group:"{group_filter}"'
+            else:
+                params['q'] = query
         elif 'searchText' in params:
-            params['searchText'] = query
+            if group_filter:
+                params['searchText'] = f'({query}) AND group:"{group_filter}"'
+            else:
+                params['searchText'] = query
         
         # Update pagination
         if 'num' in params:
@@ -202,14 +209,18 @@ class ArcGISPortalConnector:
         
         return {'results': [], 'total': 0}
     
-    def get_all_content(self, max_items: int = 1000) -> List[Dict]:
-        """Get all available content with progress tracking"""
+    def get_all_content(self, max_items: int = 1000, group_filter: str = None) -> List[Dict]:
+        """Get all available content with progress tracking and optional group filtering"""
         all_items = []
         start = 1
         num_per_request = 50  # Smaller batches for better reliability
         
         progress_bar = st.progress(0)
         status_text = st.empty()
+        
+        # Show group filter status
+        if group_filter:
+            st.sidebar.info(f"🔒 Filtering by group: {group_filter}")
         
         # Try different search strategies
         search_terms = ["*", "", "type:*", "census", "map", "data"]
@@ -226,7 +237,8 @@ class ArcGISPortalConnector:
                 result = self.search_content(
                     query=search_term, 
                     num=num_per_request, 
-                    start=current_start
+                    start=current_start,
+                    group_filter=group_filter  # Pass group filter
                 )
                 
                 if not result['results']:
@@ -237,7 +249,9 @@ class ArcGISPortalConnector:
                 # Update progress
                 progress = min(len(items_from_this_search) / max_items, 1.0)
                 progress_bar.progress(progress)
-                status_text.text(f"Found {len(items_from_this_search)} items with '{search_term}'")
+                
+                filter_text = f" (filtered by {group_filter})" if group_filter else ""
+                status_text.text(f"Found {len(items_from_this_search)} items with '{search_term}'{filter_text}")
                 
                 # Check if we got fewer results than requested (end of results)
                 if len(result['results']) < num_per_request:
@@ -248,13 +262,16 @@ class ArcGISPortalConnector:
             
             if items_from_this_search:
                 all_items = items_from_this_search
-                st.sidebar.success(f"✅ Loaded {len(all_items)} items using search term: '{search_term}'")
+                filter_text = f" using group filter '{group_filter}'" if group_filter else ""
+                st.sidebar.success(f"✅ Loaded {len(all_items)} items using search term: '{search_term}'{filter_text}")
                 break
         
-        # If still no results, try sample data
-        if not all_items:
+        # If still no results, try sample data (but only if no group filter)
+        if not all_items and not group_filter:
             st.warning("⚠️ Could not load data from API. Using sample data for demonstration.")
             all_items = self.create_sample_data()
+        elif not all_items and group_filter:
+            st.warning(f"⚠️ No data found for group '{group_filter}'. Please check the group name.")
         
         progress_bar.progress(1.0)
         status_text.text(f"✅ Total items loaded: {len(all_items)}")
@@ -511,12 +528,12 @@ def load_tfidf_vectorizer():
         return None
 
 @st.cache_data(ttl=1800)  # Cache for 30 minutes
-def load_portal_data():
-    """Load and process data from portal"""
+def load_portal_data(group_filter: str = None):
+    """Load and process data from portal with optional group filtering"""
     portal = ArcGISPortalConnector()
     
     with st.spinner("Loading data from UNL Geoportal..."):
-        raw_items = portal.get_all_content(max_items=1000)
+        raw_items = portal.get_all_content(max_items=1000, group_filter=group_filter)
     
     if not raw_items:
         st.error("No data could be loaded from the portal")
@@ -793,6 +810,24 @@ def main():
     
     # Sidebar
     with st.sidebar:
+        st.header("🔒 Content Filter")
+        
+        # Group filter option
+        use_group_filter = st.checkbox(
+            "Restrict to UNL Geoportal Content", 
+            value=True,  # Default to enabled
+            help="Only show datasets shared with the 'UNL Geoportal Content' group"
+        )
+        
+        if use_group_filter:
+            group_name = st.text_input(
+                "Group Name", 
+                value="UNL Geoportal Content",
+                help="Enter the exact group name to filter by"
+            )
+        else:
+            group_name = None
+        
         st.header("🤖 Free AI Assistant")
         has_llm, llm_client = setup_free_llm()
         
@@ -819,14 +854,18 @@ def main():
     
     # Load data
     try:
-        data_items = load_portal_data()
+        data_items = load_portal_data(group_filter=group_name if use_group_filter else None)
         
         if not data_items:
-            st.error("❌ No data available. Please check the API connection.")
-            st.info("💡 The diagnostic tool can help identify connection issues.")
+            if use_group_filter:
+                st.error(f"❌ No data found for group '{group_name}'. Please check the group name or disable the filter.")
+            else:
+                st.error("❌ No data available. Please check the API connection.")
+            st.info("💡 Try adjusting the group filter settings in the sidebar.")
             st.stop()
         
-        st.sidebar.success(f"✅ {len(data_items)} datasets loaded")
+        filter_text = f" (filtered by '{group_name}')" if use_group_filter else ""
+        st.sidebar.success(f"✅ {len(data_items)} datasets loaded{filter_text}")
         
         # Create search index for semantic/AI search
         vectorizer, tfidf_matrix, texts = None, None, None
