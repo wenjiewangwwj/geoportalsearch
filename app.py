@@ -845,8 +845,12 @@ def main():
     # Search interface
     st.header("🔍 Natural Language Search")
     
+    # Check for query parameter from example buttons
+    query_from_params = st.query_params.get("q", "")
+    
     query = st.text_input(
         "Describe what geospatial data you're looking for:",
+        value=query_from_params,
         placeholder="e.g., I'm interested in population data, Show me agricultural datasets, I need elevation maps...",
         help="Use natural language - the AI will help interpret your request!"
     )
@@ -934,8 +938,8 @@ def main():
         
         for i, example_query in enumerate(example_queries_nl):
             if st.button(f'"{example_query}"', key=f"nl_example_{i}"):
-                st.experimental_set_query_params(q=example_query)
-                st.experimental_rerun()
+                st.query_params["q"] = example_query
+                st.rerun()
     
     with col2:
         st.subheader("🔍 Keyword Examples")
@@ -948,8 +952,8 @@ def main():
         
         for i, example_query in enumerate(example_queries_kw):
             if st.button(f'"{example_query}"', key=f"kw_example_{i}"):
-                st.experimental_set_query_params(q=example_query)
-                st.experimental_rerun()
+                st.query_params["q"] = example_query
+                st.rerun()
     
     # Show AI capabilities
     st.header("🤖 Free AI Features")
