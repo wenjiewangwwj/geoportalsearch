@@ -338,29 +338,34 @@ def setup_openai():
     """Setup OpenAI client with conditional import"""
     try:
         import openai
+        from openai import OpenAI
+        
         api_key = st.sidebar.text_input("OpenAI API Key (optional)", type="password", 
                                       help="Enter your OpenAI API key for AI-enhanced search")
         if api_key:
-            openai.api_key = api_key
-            return True, openai
+            client = OpenAI(api_key=api_key)
+            return True, client
         else:
             env_key = os.getenv('OPENAI_API_KEY')
             if env_key:
-                openai.api_key = env_key
-                return True, openai
+                client = OpenAI(api_key=env_key)
+                return True, client
     except ImportError:
         st.sidebar.info("💡 Install 'openai' package for AI-enhanced features")
+        return False, None
+    except Exception as e:
+        st.sidebar.error(f"OpenAI setup failed: {e}")
         return False, None
     
     return False, None
 
-def enhance_query_with_ai(query: str, openai_module) -> str:
+def enhance_query_with_ai(query: str, openai_client) -> str:
     """Use OpenAI to enhance search queries"""
-    if not openai_module:
+    if not openai_client:
         return query
         
     try:
-        response = openai_module.ChatCompletion.create(
+        response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": """You are a GIS expert. Expand search queries with relevant geospatial terms.
@@ -383,6 +388,47 @@ Return expanded terms in one line."""},
     except Exception as e:
         st.sidebar.warning(f"AI enhancement failed: {e}")
         return query
+
+def chat_with_user(user_message: str, search_results: List, openai_client) -> str:
+    """Chat with user about search results using OpenAI"""
+    if not openai_client:
+        return "I'd be happy to help you find GIS data! However, OpenAI integration is not available right now. Try searching for specific terms related to your research needs."
+        
+    try:
+        # Prepare context about the search results
+        results_context = ""
+        if search_results:
+            results_context = "Available datasets found:\n"
+            for i, result in enumerate(search_results[:5]):
+                item = result['item']
+                results_context += f"{i+1}. {item.title} - {item.type}\n"
+                if item.description:
+                    results_context += f"   Description: {item.description[:100]}...\n"
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": f"""You are a helpful GIS data assistant for the University of Nebraska-Lincoln Geoportal. 
+                
+Help users find and understand geospatial data. Be conversational and helpful.
+
+Current search context: {results_context}
+
+Guidelines:
+- Provide specific recommendations about the datasets found
+- Explain what types of GIS data might be useful for their needs  
+- Suggest related searches if current results aren't perfect
+- Be encouraging and helpful"""},
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=300,
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content.strip()
+        
+    except Exception as e:
+        return f"I'd be happy to help you find GIS data! However, I'm having trouble accessing my AI capabilities right now ({str(e)}). Try searching for specific terms related to your research needs."
 
 @st.cache_resource
 def load_tfidf_vectorizer():
@@ -513,7 +559,7 @@ def create_search_index(data_items):
         st.error(f"Failed to create search index: {e}")
         return None, None, None
 
-def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf_matrix, texts, top_k: int = 10, use_ai: bool = False, openai_module=None):
+def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf_matrix, texts, top_k: int = 10, use_ai: bool = False, openai_client=None):
     """Perform semantic search using TF-IDF"""
     if not vectorizer or tfidf_matrix is None:
         return []
@@ -521,8 +567,8 @@ def semantic_search(query: str, data_items: List[GISDataItem], vectorizer, tfidf
     try:
         # Enhance query with AI if available
         search_query = query
-        if use_ai and openai_module:
-            search_query = enhance_query_with_ai(query, openai_module)
+        if use_ai and openai_client:
+            search_query = enhance_query_with_ai(query, openai_client)
             st.sidebar.write(f"**Enhanced query:** {search_query}")
         
         # Create query vector
@@ -684,12 +730,17 @@ def main():
     # Sidebar
     with st.sidebar:
         st.header("🤖 AI Assistant")
-        has_openai, openai_module = setup_openai()
+        has_openai, openai_client = setup_openai()
         
         if has_openai:
             st.success("✅ AI features available")
+            
+            # Chat interface
+            st.subheader("💬 Ask me about GIS data")
+            user_message = st.text_area("What can I help you find?", placeholder="e.g., What kind of population data do you have?")
         else:
             st.info("💡 Add OpenAI API key for enhanced search")
+            user_message = None
         
         st.header("🔧 Settings")
         search_method = st.selectbox(
@@ -742,7 +793,7 @@ def main():
             
             if search_method == "AI-Enhanced Search" and vectorizer is not None:
                 results = semantic_search(query, data_items, vectorizer, tfidf_matrix, texts, 
-                                        num_results, use_ai=has_openai, openai_module=openai_module)
+                                        num_results, use_ai=has_openai, openai_client=openai_client)
             elif search_method == "Semantic Search" and vectorizer is not None:
                 results = semantic_search(query, data_items, vectorizer, tfidf_matrix, texts, 
                                         num_results, use_ai=False)
